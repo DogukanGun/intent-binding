@@ -1,0 +1,97 @@
+{
+  "problem_id": "x402-intent-binding-injection",
+  "chosen_direction": "We hypothesize that prompt-injection scope-lifting on x402 micropayments is preventable by freezing user intent into a typed EIP-712 mandate signed at the human-approval moment, then enforcing that mandate's hash as a deterministic on-chain commitment via ERC-7710/7715 caveat enforcers that the corruptible agent cannot relax. The experiment forks AgentDojo's banking suite, adds real EIP-3009 transferWithAuthorization payment tools, and runs scope-lifting injection attacks across four authorization regimes (unbounded x402, allowance-only caveats, HITL gate, intent-bound mandate chain) measured by Attack Success Rate, False Rejection Rate, autonomy (TCR@0), and latency/gas overhead. The winning regime, which combines pre-signature mandate freezing with capability-based provenance separation of the planner and quarantined LLM, becomes the basis for a refined caveat-enforcer prototype library wired into a live x402 flow.",
+  "experiment_steps": [
+    "1. Set up a reproducible environment: Python 3.11 plus a Node 20/Foundry toolchain, pin dependencies in requirements.txt and package.json, and stand up a local EVM testnet (Anvil) with a deployed test stablecoin supporting EIP-3009 transferWithAuthorization.",
+    "2. Fork AgentDojo and extend its banking suite with x402 payment tools (request_quote, sign_payment_authorization with to/value/validity/nonce, settle_on_chain) over a simulated ledger, reusing its environment-state and injection-placeholder architecture.",
+    "3. Implement the four authorization regimes as pluggable policy enforcers the agent calls before settling: (A) unbounded x402 funded wallet, (B) ERC-7715 allowance-only caveats with spend caps and allowlist, (C) HITL Cart-Mandate gate, and (D) the intent-bound EIP-712 mandate chain with ERC-7710 caveat enforcers (system under test).",
+    "4. Author a scripted adversarial injection corpus inserted into tool-returned untrusted data: recipient redirection, amount inflation, repeat-spend to exhaust cap, replay of a prior authorization, scope extension (add operation / extend time window), priority-hijack 'important message', plus obfuscated and encoded variants and an adaptive per-task strongest-attack selector.",
+    "5. Write deterministic state oracles that read post-transaction ledger and on-chain state to decide independently whether the legitimate authorized payment completed and whether the attacker goal (wrong recipient, inflated amount, extra operation, replay) was achieved; never use an LLM judge.",
+    "6. Run the full experiment matrix (4 regimes x injection tasks x at least 2 models x multiple seeds), logging every per-case verdict, trace, and resource counter, and explicitly recording any dropped or skipped attack to avoid silent truncation.",
+    "7. Instrument four metric families per case: scope-lift Attack Success Rate, False Rejection Rate on legitimate payments, autonomy preservation (TCR@0, TCR@k, HITL load), and overhead (added latency in ms and gas/compute per transaction).",
+    "8. Add statistical rigor with 95% bootstrap confidence intervals on ASR/FRR, an adaptive-attack stress round that adapts to the observed defense for worst-case ASR, then select the winning regime against the validation criteria and write the rationale and baseline table to winner.md."
+  ],
+  "prototype_steps": [
+    "1. Refactor the winning intent-binding regime into a clean reusable library under src/intent_guard/ with modules for mandate signing, intent-proof binding, and caveat-enforcer integration.",
+    "2. Define a high-level API: freeze_intent(instruction) -> SignedMandate, verify_payment(proposal, mandate) -> Decision, and settle(authorization), backed by typed dataclasses for IntentMandate, PaymentProposal, Receipt, and Decision with full mypy coverage.",
+    "3. Productionize the ERC-7710 caveat enforcer contracts (Exact-calldata, AllowedTargets, ValueLte, Timestamp, Nonce, ERC20 transfer-amount/period) in Solidity, write Foundry tests, and deploy them against an ERC-4337 smart account with session keys.",
+    "4. Implement the capability-scoped agent split (privileged planner vs quarantined LLM) with CaMeL-style provenance tracking and per-tool least-privilege scopes so untrusted data can never originate a payment, and wire dual-signature plus human-readable confirmation for high-risk thresholds.",
+    "5. Add replay and mismatch protections (nonce uniqueness, ES256-only to block algorithm confusion, signature coverage over all mandate fields to block constraint stripping, identical cnf.jwk verification to block split-agent attacks), structured logging, and Prometheus metrics for observability.",
+    "6. Wire the prototype into a live x402 flow via the facilitator and chain adapter, run an end-to-end demo settling a bounded micropayment, and confirm an injected out-of-scope instruction is deterministically rejected on-chain.",
+    "7. Write unit tests with at least 90% line coverage and integration tests against a mock x402 server and the testnet, then wire the red-team harness into CI as a regression gate with thresholds (bounded ASR < 5%, FRR < 2%, overhead under target ms/gas).",
+    "8. Produce README usage examples, an architecture diagram, a migration guide from the unbounded x402 baseline, and open-source the extended AgentDojo benchmark and enforcer contracts for reproducibility."
+  ],
+  "architecture": [
+    {
+      "name": "Intent Capture and Mandate Signer",
+      "description": "Sits at the human trust boundary before any agent or LLM reasoning runs; serializes a user payment instruction into a typed EIP-712 IntentMandate (token, max amount, recipient allowlist, asset, category, resource URL hash, deadline, nonce), prompts the user wallet for an ES256/EIP-712 signature, and emits a tamper-evident mandate credential plus its SHA-256 checkout_hash commitment.",
+      "color_group": "input"
+    },
+    {
+      "name": "x402 Request Ingest",
+      "description": "Receives HTTP-native x402 payment-required challenges and signed EIP-3009 transferWithAuthorization payloads, validates request schemas, extracts the proposed from/to/value/validAfter/validBefore/nonce tuple plus resource metadata, normalizes them, and forwards a structured payment proposal to the binding and verification layers downstream.",
+      "color_group": "input"
+    },
+    {
+      "name": "Capability-Scoped Agent Planner",
+      "description": "Splits the agent into a privileged planner that only consumes trusted user instructions and a quarantined LLM that processes untrusted tool/web content, tracking CaMeL-style data provenance so injected text can never originate a payment action, and applies Progent/MiniScope per-tool least-privilege scopes before any signing request reaches the enforcer.",
+      "color_group": "logic"
+    },
+    {
+      "name": "Intent-Proof Binding Engine",
+      "description": "Compiles the proposed payment against the frozen mandate constraints, computes a per-transaction inclusion proof (Merkle leaf or zk compliance proof) showing payTo/amount/asset fall under the user-signed scope root, verifies cnf.jwk key-confirmation across linked mandates, blocks algorithm confusion and constraint stripping, and rejects out-of-scope proposals before signature generation.",
+      "color_group": "logic"
+    },
+    {
+      "name": "ERC-7710 Caveat Enforcer Stack",
+      "description": "Deterministic on-chain enforcement invoked during redeemDelegations via beforeHook/afterHook contracts including ExactCalldata, ArgsEqualityCheck, AllowedTargets, AllowedMethods, ValueLte, Timestamp, Nonce, and ERC20 transfer-amount/period enforcers, each a gas-bounded read-and-compare that reverts the entire redemption when a transaction violates the bound mandate, with no human in the loop.",
+      "color_group": "logic"
+    },
+    {
+      "name": "Red-Team Injection Harness",
+      "description": "An AgentDojo-derived evaluation engine producing paired security cases of authorized user task and injection target, scripting recipient redirection, amount inflation, cap exhaustion, replay, scope extension, and obfuscated/encoded adaptive variants, then scoring outcomes with deterministic ledger/chain state oracles rather than any hijackable LLM judge.",
+      "color_group": "metrics"
+    },
+    {
+      "name": "Four-Axis Metrics Emitter",
+      "description": "Instruments and exports Attack Success Rate, False Rejection Rate, autonomy preservation (TCR@0, TCR@k, HITL load), and overhead (added latency in ms, gas/compute per transaction) as Prometheus-style counters and histograms with per-case bootstrap confidence intervals for dashboards, Pareto plots, and CI regression gates.",
+      "color_group": "metrics"
+    },
+    {
+      "name": "Mandate and Receipt Ledger",
+      "description": "An append-only store persisting every signed mandate, its derived commitment hash, each accepted payment receipt, the authorizing mandate reference, and consumed nonces; indexes by payer, recipient, and nonce; and exposes a query API for replay detection, reconciliation, audit, and dispute resolution workflows.",
+      "color_group": "storage"
+    },
+    {
+      "name": "Settlement and Decision API",
+      "description": "Exposes a high-level verify_payment(proposal, mandate) to Decision and settle(authorization) interface, returns structured allow/deny verdicts with human-readable confirmation strings (amount, recipient, resource) for high-risk or novel-recipient payments, surfaces audit logs, and emits machine-readable build reports for downstream consumers.",
+      "color_group": "output"
+    },
+    {
+      "name": "x402 Facilitator and Chain Adapter",
+      "description": "Integrates with the external x402 facilitator and EVM RPC endpoints to broadcast verified EIP-3009 authorizations, deploy and call ERC-4337 smart accounts and ERC-7710 delegation contracts, fetch on-chain state for oracles, and bridge testnet settlement during experiments and production flows.",
+      "color_group": "external"
+    }
+  ],
+  "tech_stack": [
+    "Python 3.11",
+    "AgentDojo (forked, banking suite)",
+    "Solidity 0.8.25 with Foundry (forge/anvil)",
+    "MetaMask Delegation Toolkit (ERC-7710/7715)",
+    "ERC-4337 account abstraction (permissionless.js 0.2)",
+    "web3.py 6.20",
+    "eth-account 0.13 (EIP-712 / EIP-3009)",
+    "PyJWT 2.9 with cryptography 43 (SD-JWT / ES256)",
+    "FastAPI 0.110",
+    "pydantic 2.6",
+    "pytest 8.1",
+    "prometheus-client 0.20"
+  ],
+  "validation_criteria": [
+    "Scope-lift Attack Success Rate under the intent-bound regime <= 5%, versus the unbounded x402 baseline, with non-overlapping 95% bootstrap confidence intervals.",
+    "False Rejection Rate on legitimate authorized payments < 2% (no more than a 1 percentage-point increase over the unbounded baseline).",
+    "Autonomy preserved: TCR@0 (fraction of tasks settled with zero human approvals) >= 90% of the unbounded baseline, strictly above the HITL-gate regime.",
+    "Per-transaction enforcement overhead < 50 ms added latency and < 80,000 gas per caveat-enforced redemption.",
+    "Replay and temporal attacks (nonce reuse, expired validBefore) blocked at >= 99.99% by the runtime verification and Nonce/Timestamp enforcers."
+  ]
+}

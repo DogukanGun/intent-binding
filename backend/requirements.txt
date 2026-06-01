@@ -1,0 +1,20 @@
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-dotenv==1.0.1
+
+# Ethereum / EIP-712 / secp256k1
+eth-account==0.13.4
+web3==7.6.1
+
+# Agent LLM (Venice is OpenAI-compatible)
+openai==1.59.6
+
+# HTTP client (1Shot relayer, x402 fetches)
+httpx==0.28.1
+
+# Observability
+prometheus-client==0.21.1
+
+# Dev / test
+pytest==8.3.4
