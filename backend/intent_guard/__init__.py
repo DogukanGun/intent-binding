@@ -26,6 +26,7 @@ from .types import (
     SignedMandate,
 )
 from .core import Guard, SUPPORTED_ALGS
+from . import eip712
 
 __all__ = [
     "Guard",
@@ -37,6 +38,7 @@ __all__ = [
     "Receipt",
     "ScopeCaveat",
     "SignedMandate",
+    "eip712",
 ]
 
 __version__ = "0.1.0"

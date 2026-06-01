@@ -1,29 +1,29 @@
 """Core intent-binding engine: freeze -> verify -> settle.
 
-The enforcement chain in `verify_payment` is the heart of the prototype. Each
-check corresponds to an ERC-7710 caveat enforcer or a protocol-level guard
-proven necessary by the experiment. A proposal is allowed ONLY when every check
-passes; otherwise `Decision.reasons` lists each violated caveat.
+The enforcement chain in `verify_payment` is the heart of the system. Each check
+corresponds to an ERC-7710 caveat enforcer or a protocol-level guard proven
+necessary by the experiment. A proposal is allowed ONLY when every check passes;
+otherwise `Decision.reasons` lists each violated caveat.
 
-Cryptography note
------------------
-This prototype uses HMAC-SHA256 as a stand-in for ES256/EIP-712 signing so it
-runs on the standard library with zero install. The security *properties* are
-faithful: the signature covers a deterministic hash of ALL mandate fields, so
-any constraint relaxation invalidates it. In production, swap `_Signer` for
-eth-account (EIP-712) / PyJWT-ES256 — the verify chain is unchanged.
+Cryptography
+------------
+Production EIP-712 + secp256k1 via `eth-account` (see `eip712.py`). The mandate is
+signed as EIP-712 typed data — the same document a wallet signs — so the digest
+covers ALL fields and any constraint relaxation invalidates the signature. The
+on-chain ERC-7710 caveats enforce the same bounds in the EVM; this is the
+off-chain pre-flight that mirrors them.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import hashlib
-import hmac
-import json
 import logging
 import os
 from typing import Optional
 
+from eth_account import Account
+
+from . import eip712
 from .types import (
     Decision,
     IntentMandate,
@@ -36,48 +36,34 @@ from .types import (
 
 logger = logging.getLogger("intent_guard")
 
-# ES256 only. Accepting "HS256"/"none" would enable algorithm-confusion attacks.
-SUPPORTED_ALGS: frozenset[str] = frozenset({"ES256"})
-
-
-def _canonical(obj: object) -> bytes:
-    """Deterministic JSON encoding for hashing (sorted keys, no whitespace)."""
-    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
-def _struct_hash(mandate: IntentMandate) -> str:
-    """EIP-712-style struct hash covering EVERY mandate field.
-
-    Stand-in: sha256 here; keccak256 over typed EIP-712 data in production.
-    Covering all fields is what makes constraint-stripping detectable.
-    """
-    payload = dataclasses.asdict(mandate)  # includes caveat + nonce + cnf + chain
-    return hashlib.sha256(_canonical(payload)).hexdigest()
-
-
-class _Signer:
-    """Pluggable signer. HMAC stand-in for ES256/EIP-712 (see module docstring)."""
-
-    def __init__(self, key: bytes) -> None:
-        self._key = key
-
-    def sign(self, struct_hash: str) -> str:
-        return hmac.new(self._key, struct_hash.encode("utf-8"), hashlib.sha256).hexdigest()
-
-    def verify(self, struct_hash: str, signature: str) -> bool:
-        expected = self.sign(struct_hash)
-        return hmac.compare_digest(expected, signature)
+# EIP-712 / secp256k1 only. Accepting another alg would enable algorithm-confusion.
+SUPPORTED_ALGS: frozenset[str] = frozenset({"EIP712"})
 
 
 class Guard:
     """Stateful intent-binding guard.
 
-    Holds the signing key and a consumed-nonce set so a redeemed mandate cannot
-    be replayed. Construct once per signing authority (the privileged planner).
+    Construct with the privileged planner's signing key (the authority that
+    freezes user intent). For the production path where the *wallet* signs the
+    mandate externally (MetaMask EIP-712), construct with `expected_signer` and
+    attach the wallet signature via `attach_signature`.
     """
 
-    def __init__(self, signing_key: Optional[bytes] = None) -> None:
-        self._signer = _Signer(signing_key or os.urandom(32))
+    def __init__(
+        self,
+        signing_key: Optional[str | bytes] = None,
+        *,
+        expected_signer: Optional[str] = None,
+        verifying_contract: str = eip712.ZERO_ADDRESS,
+    ) -> None:
+        if signing_key is None and expected_signer is None:
+            # Generate an ephemeral key so the guard is usable out of the box.
+            signing_key = "0x" + os.urandom(32).hex()
+        self._account = Account.from_key(signing_key) if signing_key is not None else None
+        self._expected_signer = (
+            expected_signer or (self._account.address if self._account else None)
+        )
+        self._verifying_contract = verifying_contract
         self._consumed_nonces: set[str] = set()
         self.metrics: dict[str, int] = {
             "frozen": 0,
@@ -86,6 +72,10 @@ class Guard:
             "settled": 0,
             "replay_blocked": 0,
         }
+
+    @property
+    def signer_address(self) -> Optional[str]:
+        return self._expected_signer
 
     # ------------------------------------------------------------------ freeze
     def freeze_intent(
@@ -97,24 +87,47 @@ class Guard:
         nonce: Optional[str] = None,
         chain_id: int = 8453,
     ) -> SignedMandate:
-        """Capture human-approved intent into a signed, immutable mandate."""
-        mandate = IntentMandate(
+        """Capture human-approved intent into a signed, immutable mandate.
+
+        Signs locally with the planner key. (In the wallet-signs-externally flow
+        use `build_mandate` + `attach_signature` instead.)
+        """
+        if self._account is None:
+            raise RuntimeError(
+                "Guard has no signing key; use build_mandate()+attach_signature() "
+                "for the wallet-signed flow."
+            )
+        mandate = self.build_mandate(instruction, caveat, cnf_jwk, nonce=nonce, chain_id=chain_id)
+        digest = eip712.mandate_digest(mandate, self._verifying_contract)
+        signature = eip712.sign_mandate(mandate, self._account.key, self._verifying_contract)
+        signed = SignedMandate(mandate=mandate, struct_hash=digest, signature=signature, alg="EIP712")
+        self.metrics["frozen"] += 1
+        logger.info("intent_frozen", extra={"mandate_hash": digest, "nonce": mandate.nonce})
+        return signed
+
+    def build_mandate(
+        self,
+        instruction: str,
+        caveat: ScopeCaveat,
+        cnf_jwk: str,
+        *,
+        nonce: Optional[str] = None,
+        chain_id: int = 8453,
+    ) -> IntentMandate:
+        """Build the unsigned mandate (for the wallet-signs-externally flow)."""
+        return IntentMandate(
             instruction=instruction,
             caveat=caveat,
-            nonce=nonce or os.urandom(16).hex(),
+            nonce=nonce or ("0x" + os.urandom(32).hex()),
             cnf_jwk=cnf_jwk,
             chain_id=chain_id,
         )
-        struct_hash = _struct_hash(mandate)
-        signed = SignedMandate(
-            mandate=mandate,
-            struct_hash=struct_hash,
-            signature=self._signer.sign(struct_hash),
-            alg="ES256",
-        )
+
+    def attach_signature(self, mandate: IntentMandate, signature: str) -> SignedMandate:
+        """Wrap a mandate with an externally produced wallet signature."""
+        digest = eip712.mandate_digest(mandate, self._verifying_contract)
         self.metrics["frozen"] += 1
-        logger.info("intent_frozen", extra={"mandate_hash": struct_hash, "nonce": mandate.nonce})
-        return signed
+        return SignedMandate(mandate=mandate, struct_hash=digest, signature=signature, alg="EIP712")
 
     # ------------------------------------------------------------------ verify
     def verify_payment(
@@ -133,13 +146,18 @@ class Guard:
         if signed.alg not in SUPPORTED_ALGS:
             reasons.append(f"alg_confusion:{signed.alg}")
 
-        # 2. Signature coverage — recompute hash over ALL fields and verify.
-        #    A stripped/relaxed constraint changes the hash -> signature fails.
-        recomputed = _struct_hash(m)
+        # 2. Signature coverage — recompute the EIP-712 digest over ALL fields and
+        #    recover the signer. A stripped/relaxed constraint changes the digest;
+        #    a forged signature recovers to the wrong address.
+        recomputed = eip712.mandate_digest(m, self._verifying_contract)
         if recomputed != signed.struct_hash:
             reasons.append("mandate_tampered:hash_mismatch")
-        elif not self._signer.verify(signed.struct_hash, signed.signature):
-            reasons.append("bad_signature")
+        else:
+            recovered = eip712.recover_signer(m, signed.signature, self._verifying_contract)
+            if recovered is None:
+                reasons.append("bad_signature")
+            elif self._expected_signer is not None and recovered.lower() != self._expected_signer.lower():
+                reasons.append("bad_signature")
 
         # 3. Provenance separation (CaMeL) — untrusted data cannot originate pay.
         if proposal.provenance is not Provenance.USER:
@@ -156,11 +174,11 @@ class Guard:
             reasons.append("nonce_replayed")
 
         # 6. AllowedTargets enforcer.
-        if proposal.target not in c.allowed_targets:
+        if proposal.target.lower() not in {t.lower() for t in c.allowed_targets}:
             reasons.append("target_not_allowed")
 
         # 7. Asset + ValueLte enforcer.
-        if proposal.token != c.token:
+        if proposal.token.lower() != c.token.lower():
             reasons.append("token_mismatch")
         if proposal.value > c.max_value:
             reasons.append("value_exceeds_cap")
@@ -183,8 +201,14 @@ class Guard:
         return Decision(allowed=allowed, reasons=tuple(reasons), mandate_hash=signed.struct_hash)
 
     # ------------------------------------------------------------------ settle
-    def settle(self, signed: SignedMandate, proposal: PaymentProposal) -> Receipt:
-        """Re-verify then redeem, consuming the nonce so it cannot be replayed."""
+    def settle(
+        self, signed: SignedMandate, proposal: PaymentProposal, *, tx_hash: Optional[str] = None
+    ) -> Receipt:
+        """Re-verify then mark redeemed, consuming the nonce against replay.
+
+        `tx_hash` is supplied by the relayer when the redemption lands on-chain;
+        absent that, a deterministic placeholder is used (off-chain dry run).
+        """
         decision = self.verify_payment(proposal, signed)
         if not decision.allowed:
             raise PermissionError(f"settlement refused: {', '.join(decision.reasons)}")
@@ -194,9 +218,10 @@ class Guard:
             raise PermissionError("settlement refused: nonce_replayed")
         self._consumed_nonces.add(signed.mandate.nonce)
 
-        tx_hash = "0x" + hashlib.sha256(
-            (signed.struct_hash + signed.mandate.nonce + "redeem").encode()
-        ).hexdigest()
+        if tx_hash is None:
+            tx_hash = "0x" + hashlib.sha256(
+                (signed.struct_hash + signed.mandate.nonce + "redeem").encode()
+            ).hexdigest()
         self.metrics["settled"] += 1
         logger.info("settled", extra={"tx_hash": tx_hash, "amount": proposal.value})
         return Receipt(
@@ -206,6 +231,10 @@ class Guard:
             amount=proposal.value,
             target=proposal.target,
         )
+
+    def mark_consumed(self, nonce: str) -> None:
+        """Record a nonce as spent (e.g. after the relayer confirms on-chain)."""
+        self._consumed_nonces.add(nonce)
 
     # ----------------------------------------------------------------- metrics
     def metrics_text(self) -> str:

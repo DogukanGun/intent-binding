@@ -61,9 +61,9 @@ class SignedMandate:
     """A mandate plus its deterministic commitment and signature."""
 
     mandate: IntentMandate
-    struct_hash: str          # EIP-712-style hash over ALL mandate fields
+    struct_hash: str          # EIP-712 digest over ALL mandate fields
     signature: str
-    alg: str = "ES256"        # ES256 only — anything else is algorithm confusion
+    alg: str = "EIP712"       # EIP712/secp256k1 only — anything else is algorithm confusion
 
 
 @dataclass(frozen=True)

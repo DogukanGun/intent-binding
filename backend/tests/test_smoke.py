@@ -9,9 +9,10 @@ import dataclasses
 
 from intent_guard import Guard, PaymentProposal, Provenance, ScopeCaveat
 
-USDC = "0xUSDC"
-MERCHANT = "0xMerchant"
-ATTACKER = "0xAttacker"
+# Real 20-byte addresses (EIP-712 `address` fields must be valid).
+USDC = "0x036CbD53842c5426634e7929541eC2318f3dCF7e"  # Base Sepolia test USDC
+MERCHANT = "0x1111111111111111111111111111111111111111"
+ATTACKER = "0x2222222222222222222222222222222222222222"
 
 
 def _setup():
