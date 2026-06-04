@@ -73,6 +73,8 @@ class RunRequest(BaseModel):
     attack: Optional[str] = "clean"
     guarded: bool = True
     planner: str = "naive"
+    # Optional raw invoice override so a judge can paste/edit their own injection.
+    invoice_text: Optional[str] = None
 
 
 # -------------------------------------------------------------------- routes
@@ -154,6 +156,9 @@ def agent_run(req: RunRequest):
         attack=req.attack, merchant=MERCHANT, attacker=ATTACKER, token=USDC_ADDRESS,
         amount_usdc=SESSION.amount_usdc, cap_usdc=SESSION.cap_usdc,
     )
+    # A judge may override the invoice text with their own (edited) injection.
+    if req.invoice_text is not None:
+        inv["invoice"] = {**inv["invoice"], "text": req.invoice_text, "edited": True}
     agent = PaymentAgent(SESSION.guard, SESSION.signed, venice)
     run = agent.run(inv["invoice"]["text"], guarded=req.guarded, planner=req.planner)
     return {
