@@ -23,6 +23,7 @@ from agent.agent import PaymentAgent, usdc, from_usdc
 from agent.venice import VeniceClient
 from x402.merchant import make_invoice_402
 from x402.injections import FAMILIES
+from relayer.oneshot import OneShotRelayer
 
 load_dotenv()
 
@@ -175,6 +176,17 @@ def agent_run(req: RunRequest):
         "reasons": run.reasons,
         "narrative": run.narrative,
     }
+
+
+@app.get("/relayer/capabilities")
+def relayer_capabilities():
+    """Live check against the keyless 1Shot permissionless relayer (EIP-7710)."""
+    try:
+        relayer = OneShotRelayer(chain_id=CHAIN_ID)
+        caps = relayer.get_capabilities()
+        return {"available": True, "capabilities": caps}
+    except Exception as exc:  # network / relayer down
+        return {"available": False, "error": str(exc)}
 
 
 @app.get("/metrics", response_class=PlainTextResponse)
