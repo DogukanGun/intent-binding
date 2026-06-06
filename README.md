@@ -60,7 +60,36 @@ cp .env.local.example .env.local
 npm run dev   # http://localhost:3000
 ```
 
-## Status
+## Demo flow
 
-Scaffold + research import complete. Build phases tracked in the plan; the
-`intent_guard` engine (freeze → verify → settle) is ported next with real EIP-712 signing.
+1. **Freeze intent** — approve once ("pay up to 5 USDC to Blue Bottle"); MetaMask signs an
+   ERC-7710 delegation with `allowedTargets` / `erc20PeriodTransfer` / `timestamp` caveats.
+2. **Run the agent** on an invoice — pick an injection (or paste your own), toggle the guard.
+   - Guard **off** + poisoned → **wallet drained** to the attacker (baseline x402).
+   - Guard **on** + poisoned → **blocked** (`target_not_allowed`, `value_exceeds_cap`).
+   - Guard **on** + clean → **paid**, gaslessly via the 1Shot relayer.
+
+## What's built (and verified)
+
+| Layer | Status |
+|-------|--------|
+| `intent_guard` — EIP-712/secp256k1 freeze→verify→settle | ✅ 13 tests |
+| Venice agent — CaMeL planner/quarantined-LLM split | ✅ reproduces 50%→0% |
+| x402 merchant + 9 injection families | ✅ |
+| FastAPI API (freeze / invoice / run / relayer) | ✅ live-verified |
+| Frontend — MetaMask delegation + demo UX | ✅ `next build` passes |
+| 1Shot relayer (EIP-7710, keyless) | ✅ live `getCapabilities` reachable |
+| **Total** | **23 backend tests passing** |
+
+## Docs
+
+- [`docs/design.md`](docs/design.md) — protocol + threat model
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — local run, deploy, on-chain path
+- [`docs/demo-script.md`](docs/demo-script.md) — 3-minute video script
+- [`docs/deck-outline.md`](docs/deck-outline.md) — pitch deck outline
+- [`docs/paper.pdf`](docs/paper.pdf) — research backing
+
+## Submission checklist
+
+- [x] Public repo · [x] Live product (deploy per RUNBOOK) · [ ] 3-min video (script ready)
+- [ ] Deck (outline ready) · [x] MetaMask Smart Accounts + ERC-7710 · [x] x402 · [x] Venice · [x] 1Shot

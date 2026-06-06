@@ -1,0 +1,21 @@
+# One-click backend deploy on Render (https://render.com).
+# Frontend deploys separately on Vercel (auto-detected Next.js in /frontend).
+services:
+  - type: web
+    name: intentguard-backend
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: VENICE_API_KEY
+        sync: false
+      - key: VENICE_MODEL
+        value: venice-uncensored
+      - key: CHAIN_ID
+        value: "84532"
+      - key: USDC_ADDRESS
+        value: "0x036CbD53842c5426634e7929541eC2318f3dCF7e"
+      - key: CORS_ORIGINS
+        sync: false # set to your Vercel URL, e.g. https://intent-binding.vercel.app
