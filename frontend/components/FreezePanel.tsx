@@ -1,5 +1,6 @@
 "use client";
 
+import { motion } from "framer-motion";
 import { useState } from "react";
 import { api, type FreezeResult } from "@/lib/api";
 
@@ -61,13 +62,22 @@ export function FreezePanel({
       {err && <p className="mt-3 text-sm text-danger">{err}</p>}
 
       {frozen && (
-        <div className="mt-4 space-y-1 rounded-lg border border-gray-800 bg-bg p-3 text-xs">
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.3 }}
+          className="mt-4 space-y-1 rounded-lg border border-ok/40 bg-bg p-3 text-xs"
+        >
+          <div className="mb-1 flex items-center gap-2 text-ok">
+            <span>🔒</span>
+            <span className="font-semibold">intent frozen — EIP-712 mandate signed</span>
+          </div>
           <Row k="mandate hash" v={frozen.mandate_hash} mono />
           <Row k="signer" v={frozen.signer} mono />
           <Row k="allowed target" v={frozen.caveat.allowed_targets[0]} mono />
           <Row k="cap" v={`${frozen.caveat.cap_usdc} USDC`} />
           <Row k="valid until" v={new Date(frozen.caveat.not_after * 1000).toLocaleTimeString()} />
-        </div>
+        </motion.div>
       )}
     </section>
   );

@@ -42,7 +42,7 @@ class VeniceClient:
         self.base_url = base_url or os.environ.get(
             "VENICE_BASE_URL", "https://api.venice.ai/api/v1"
         )
-        self.model = model or os.environ.get("VENICE_MODEL", "venice-uncensored")
+        self.model = model or os.environ.get("VENICE_MODEL", "venice-uncensored-1-2")
         self._client = None
         if self.api_key:
             try:
