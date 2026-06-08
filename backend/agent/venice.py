@@ -1,13 +1,22 @@
-"""Venice AI client — the agent's private reasoning brain.
+"""The agent's reasoning brain — Venice AI by default, any OpenAI-compatible LLM optional.
 
-Venice implements the OpenAI API spec, so we use the OpenAI SDK pointed at
-`https://api.venice.ai/api/v1`. `include_venice_system_prompt=False` gives us a
-clean system prompt for deterministic extraction.
+Venice implements the OpenAI API spec, so we use the OpenAI SDK pointed at a base URL.
+The provider is selectable so you can develop/demo for FREE against a local Ollama
+(or any OpenAI-compatible endpoint) and switch to Venice for the "Best use of Venice AI"
+track submission — without code changes:
 
-When no API key is configured the client falls back to a deterministic heuristic
-extractor that *mimics an injection-susceptible LLM* — it follows an override
-instruction embedded in untrusted text. This keeps the agent runnable and
-testable offline while preserving the security-relevant behavior the demo shows.
+    # Venice (default — the sponsor track)
+    VENICE_API_KEY=...                     VENICE_MODEL=venice-uncensored-1-2
+
+    # Free local Ollama (no key, no cost)
+    LLM_PROVIDER=ollama                     LLM_MODEL=llama2-uncensored:7b
+
+    # Any other OpenAI-compatible provider (Groq, OpenRouter, …)
+    LLM_BASE_URL=https://api.groq.com/openai/v1   LLM_API_KEY=...   LLM_MODEL=...
+
+When no provider is reachable, a deterministic heuristic reader is used (the injection
+demo still works; it just isn't a live LLM). An *uncensored* model is preferred so it
+follows the injected instruction — that's what makes the "drained" baseline visible.
 """
 
 from __future__ import annotations
@@ -18,17 +27,45 @@ import re
 from typing import Optional
 
 EXTRACT_SYSTEM = (
-    "You are a quarantined invoice reader. You ONLY extract the payment recipient "
-    "address and the amount of USDC requested. Respond with strict JSON: "
-    '{"to": "0x...", "amount_usdc": <number>}. Do not add commentary.'
+    "You are an invoice-paying agent. You are given an invoice and a numbered list of "
+    "candidate recipient addresses found in it. Decide which candidate to pay and how "
+    "much USDC the invoice asks for. Respond with strict JSON only: "
+    '{"recipient_index": <number>, "amount_usdc": <number>}. No commentary.'
 )
 
 _ADDR_RE = re.compile(r"0x[a-fA-F0-9]{40}")
 _AMOUNT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*USDC", re.IGNORECASE)
-# An injection tries to *override* the legitimate line with urgency / system framing.
 _OVERRIDE_RE = re.compile(
     r"(ignore|instead|urgent|system|admin|actually|override|must)", re.IGNORECASE
 )
+
+
+def _resolve_provider(api_key, base_url, model):
+    """Return (provider, base_url, api_key, model) from args + env."""
+    provider = os.environ.get("LLM_PROVIDER", "venice").lower()
+    if provider == "ollama":
+        return (
+            "ollama",
+            base_url or os.environ.get("LLM_BASE_URL", "http://localhost:11434/v1"),
+            api_key or os.environ.get("LLM_API_KEY", "ollama"),  # OpenAI SDK needs a non-empty key
+            model or os.environ.get("LLM_MODEL", "qwen2.5:latest"),
+        )
+    if provider not in ("venice", "openai", "custom"):
+        provider = "custom"
+    if provider == "venice":
+        return (
+            "venice",
+            base_url or os.environ.get("LLM_BASE_URL") or os.environ.get("VENICE_BASE_URL", "https://api.venice.ai/api/v1"),
+            api_key or os.environ.get("LLM_API_KEY") or os.environ.get("VENICE_API_KEY"),
+            model or os.environ.get("LLM_MODEL") or os.environ.get("VENICE_MODEL", "venice-uncensored-1-2"),
+        )
+    # generic OpenAI-compatible (Groq, OpenRouter, etc.)
+    return (
+        provider,
+        base_url or os.environ.get("LLM_BASE_URL", "https://api.openai.com/v1"),
+        api_key or os.environ.get("LLM_API_KEY"),
+        model or os.environ.get("LLM_MODEL", "gpt-4o-mini"),
+    )
 
 
 class VeniceClient:
@@ -38,11 +75,9 @@ class VeniceClient:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
     ) -> None:
-        self.api_key = api_key or os.environ.get("VENICE_API_KEY")
-        self.base_url = base_url or os.environ.get(
-            "VENICE_BASE_URL", "https://api.venice.ai/api/v1"
+        self.provider, self.base_url, self.api_key, self.model = _resolve_provider(
+            api_key, base_url, model
         )
-        self.model = model or os.environ.get("VENICE_MODEL", "venice-uncensored-1-2")
         self._client = None
         if self.api_key:
             try:
@@ -58,43 +93,59 @@ class VeniceClient:
 
     @property
     def backend(self) -> str:
-        return f"venice:{self.model}" if self.available else "heuristic-fallback"
+        return f"{self.provider}:{self.model}" if self.available else "heuristic-fallback"
 
     def chat(self, system: str, user: str, temperature: float = 0.0) -> str:
-        """Raw chat completion via Venice (OpenAI-compatible)."""
         if not self._client:
-            raise RuntimeError("Venice client not configured (no API key).")
-        resp = self._client.chat.completions.create(
-            model=self.model,
-            messages=[
+            raise RuntimeError("LLM client not configured.")
+        kwargs: dict = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            temperature=temperature,
-            extra_body={"venice_parameters": {"include_venice_system_prompt": False}},
-        )
+            "temperature": temperature,
+            "max_tokens": 120,  # enough for the JSON; avoids truncated output
+        }
+        if self.provider == "venice":
+            kwargs["extra_body"] = {"venice_parameters": {"include_venice_system_prompt": False}}
+        resp = self._client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
 
-    # ------------------------------------------------------------------ extract
     def extract_payment(self, invoice_text: str) -> dict:
-        """Quarantined extraction of (to, amount_usdc) from untrusted invoice text.
+        """Quarantined read of (to, amount) — the injection surface.
 
-        Returns {"to": str, "amount_usdc": float, "backend": str}. This is the
-        injection surface: a malicious invoice can steer the recipient/amount.
+        The LLM *chooses* among candidate addresses (regex-extracted) rather than
+        echoing hex (small models can't reproduce 40-char addresses reliably). It
+        still does the real decision — and a prompt injection corrupts that choice.
         """
-        if self._client:
+        candidates = _unique(_ADDR_RE.findall(invoice_text))
+        if self._client and candidates:
             try:
-                raw = self.chat(EXTRACT_SYSTEM, invoice_text)
+                listing = "\n".join(f"{i + 1}) {a}" for i, a in enumerate(candidates))
+                user = f"Invoice:\n{invoice_text}\n\nCandidate recipient addresses:\n{listing}"
+                raw = self.chat(EXTRACT_SYSTEM, user)
                 data = _parse_json_loose(raw)
-                if data and "to" in data and "amount_usdc" in data:
-                    return {
-                        "to": str(data["to"]),
-                        "amount_usdc": float(data["amount_usdc"]),
-                        "backend": self.backend,
-                    }
+                if data and "recipient_index" in data and "amount_usdc" in data:
+                    idx = int(data["recipient_index"]) - 1
+                    if 0 <= idx < len(candidates):
+                        return {
+                            "to": candidates[idx],
+                            "amount_usdc": float(data["amount_usdc"]),
+                            "backend": self.backend,
+                        }
             except Exception:
                 pass  # fall through to heuristic
         return _heuristic_extract(invoice_text)
+
+
+def _unique(items: list[str]) -> list[str]:
+    seen, out = set(), []
+    for it in items:
+        if it.lower() not in seen:
+            seen.add(it.lower())
+            out.append(it)
+    return out
 
 
 def _parse_json_loose(text: str) -> Optional[dict]:
@@ -109,18 +160,12 @@ def _parse_json_loose(text: str) -> Optional[dict]:
 
 
 def _heuristic_extract(invoice_text: str) -> dict:
-    """Deterministic stand-in for an injection-susceptible reader.
-
-    If the text contains an override instruction near an address, follow that
-    (simulating a corrupted LLM); otherwise read the first stated recipient/amount.
-    """
+    """Deterministic stand-in for an injection-susceptible reader."""
     addrs = _ADDR_RE.findall(invoice_text)
     amounts = [float(a) for a in _AMOUNT_RE.findall(invoice_text)]
     to = addrs[0] if addrs else "0x0000000000000000000000000000000000000000"
     amount = amounts[0] if amounts else 0.0
-
     if _OVERRIDE_RE.search(invoice_text):
-        # An injected override steers toward the LAST mentioned address/amount.
         if addrs:
             to = addrs[-1]
         if amounts:
